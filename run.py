@@ -34,11 +34,24 @@ PORT = int(os.environ.get("PORT", "8080"))
 DEFAULT_WORKLOAD_ID = os.environ.get("WORKLOAD_ID", "geonames")
 DEFAULT_TEST_PROCEDURE = os.environ.get("TEST_PROCEDURE", "")
 DEFAULT_TELEMETRY = os.environ.get("TELEMETRY", "node-stats")
+# Exclude three node-stats fields that are None or absent on Aiven managed OpenSearch
+# (containerised, no process cpu/cgroup; indexing_pressure missing on older minors).
+# See docs/aiven-application-benchmark.md and the OSB Telemetry Research plan.
+DEFAULT_TELEMETRY_PARAMS = os.environ.get(
+    "TELEMETRY_PARAMS",
+    "node-stats-include-process:false,"
+    "node-stats-include-cgroup:false,"
+    "node-stats-include-indexing-pressure:false",
+)
 
 _lock = threading.Lock()
 _state: dict = {"status": "idle", "result": None}
 _log_lines: list[str] = []
-_LOG_TAIL = 50
+# Size of the in-memory ring buffer of OSB stdout/stderr lines exposed via
+# GET /status as "log_tail". The orchestrator drains this on every poll, so
+# 200 lines is plenty to cover one ~10-15s poll interval at heavy log rates
+# without spilling. Override via LOG_TAIL_LINES env var on the container.
+_LOG_TAIL = max(10, int(os.environ.get("LOG_TAIL_LINES", "200")))
 
 
 def _now() -> str:
@@ -80,7 +93,13 @@ def _parse_metrics(stdout: str) -> dict:
     }
 
 
-def _run_benchmark(opensearch_url: str, workload_id: str, test_procedure: str, telemetry: str) -> None:
+def _run_benchmark(
+    opensearch_url: str,
+    workload_id: str,
+    test_procedure: str,
+    telemetry: str,
+    telemetry_params: str,
+) -> None:
     parsed = urlparse(opensearch_url)
     host = parsed.hostname or ""
     port = parsed.port or 9200
@@ -98,6 +117,8 @@ def _run_benchmark(opensearch_url: str, workload_id: str, test_procedure: str, t
     ]
     if telemetry:
         argv.append(f"--telemetry={telemetry}")
+        if telemetry_params:
+            argv.append(f"--telemetry-params={telemetry_params}")
     if test_procedure:
         argv.append(f"--test-procedure={test_procedure}")
     client_opts = "use_ssl:true,verify_certs:true"
@@ -105,7 +126,11 @@ def _run_benchmark(opensearch_url: str, workload_id: str, test_procedure: str, t
         client_opts += f",basic_auth_user:{user},basic_auth_password:{password}"
     argv += ["--client-options", client_opts]
 
-    print(f"[runner] starting OSB: workload={workload_id} target={target_hosts}", flush=True)
+    print(
+        f"[runner] starting OSB: workload={workload_id} target={target_hosts} "
+        f"telemetry={telemetry or '<none>'} telemetry_params={telemetry_params or '<defaults>'}",
+        flush=True,
+    )
 
     collected: list[str] = []
     with subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True) as proc:
@@ -182,14 +207,29 @@ class Handler(BaseHTTPRequestHandler):
         workload_id = (body.get("workload_id") or DEFAULT_WORKLOAD_ID).strip()
         test_procedure = (body.get("test_procedure") or DEFAULT_TEST_PROCEDURE).strip()
         telemetry = (body.get("telemetry") or DEFAULT_TELEMETRY).strip()
+        # Empty string in the request explicitly disables telemetry-params (use OSB defaults).
+        # Missing key falls back to the runner's DEFAULT_TELEMETRY_PARAMS env var.
+        raw_params = body.get("telemetry_params")
+        telemetry_params = (
+            (raw_params or "").strip() if raw_params is not None else DEFAULT_TELEMETRY_PARAMS
+        )
 
         t = threading.Thread(
             target=_run_benchmark,
-            args=(opensearch_url, workload_id, test_procedure, telemetry),
+            args=(opensearch_url, workload_id, test_procedure, telemetry, telemetry_params),
             daemon=True,
         )
         t.start()
-        self._send_json(202, {"status": "started", "workload_id": workload_id, "target": opensearch_url.split("@")[-1]})
+        self._send_json(
+            202,
+            {
+                "status": "started",
+                "workload_id": workload_id,
+                "telemetry": telemetry,
+                "telemetry_params": telemetry_params,
+                "target": opensearch_url.split("@")[-1],
+            },
+        )
 
 
 if __name__ == "__main__":
