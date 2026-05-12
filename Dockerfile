@@ -15,4 +15,5 @@ COPY run.py .
 
 EXPOSE 8080
 
+ENTRYPOINT []
 CMD ["python3", "run.py"]
