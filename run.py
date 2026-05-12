@@ -94,9 +94,10 @@ def run_benchmark() -> None:
         "--pipeline=benchmark-only",
         f"--workload={WORKLOAD_ID}",
         f"--target-hosts={target_hosts}",
-        f"--telemetry={TELEMETRY}",
         "--kill-running-processes",
     ]
+    if TELEMETRY:
+        argv.append(f"--telemetry={TELEMETRY}")
     if TEST_PROCEDURE:
         argv.append(f"--test-procedure={TEST_PROCEDURE}")
     if user and password:
