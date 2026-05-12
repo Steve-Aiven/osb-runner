@@ -1,12 +1,21 @@
 #!/usr/bin/env python3
 """
-Aiven Application OSB runner.
+Aiven Application OSB runner — HTTP job server.
 
-On start:
-  1. Parses OPENSEARCH_URL (injected by Aiven service integration).
-  2. Runs opensearch-benchmark against that cluster.
-  3. Writes /app/app_results.json with the summary metrics.
-  4. Serves /app/ on port 8080 so the orchestrator (and Aiven) can reach it.
+Deploy once. The orchestrator submits benchmark jobs via HTTP; no redeploy is
+needed to target a different OpenSearch cluster.
+
+Endpoints:
+  POST /run   {"opensearch_url": "https://user:pass@host:port",
+               "workload_id": "geonames",        # optional, default: WORKLOAD_ID env
+               "test_procedure": "",              # optional
+               "telemetry": "node-stats"}         # optional
+              → 202 {"status": "started"}  or  409 {"status": "busy"}
+
+  GET  /status → {"status": "idle"|"running"|"done"|"error",
+                  "result": {...} | null}
+
+  GET  /       → same as /status (Aiven health check + orchestrator poll)
 """
 
 from __future__ import annotations
@@ -15,28 +24,23 @@ import json
 import os
 import re
 import subprocess
-import sys
 import threading
 from datetime import datetime, timezone
-from http.server import HTTPServer, SimpleHTTPRequestHandler
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from urllib.parse import urlparse
 
-RESULTS_FILE = Path("/app/app_results.json")
 PORT = int(os.environ.get("PORT", "8080"))
-WORKLOAD_ID = os.environ.get("WORKLOAD_ID", "geonames")
-TEST_PROCEDURE = os.environ.get("TEST_PROCEDURE", "")
-TELEMETRY = os.environ.get("TELEMETRY", "node-stats")
+DEFAULT_WORKLOAD_ID = os.environ.get("WORKLOAD_ID", "geonames")
+DEFAULT_TEST_PROCEDURE = os.environ.get("TEST_PROCEDURE", "")
+DEFAULT_TELEMETRY = os.environ.get("TELEMETRY", "node-stats")
+
+_lock = threading.Lock()
+_state: dict = {"status": "idle", "result": None}
 
 
-def _parse_opensearch_url(url: str) -> tuple[str, str, str]:
-    """Return (host:port, user, password) from an https://user:pass@host:port URL."""
-    parsed = urlparse(url)
-    host = parsed.hostname or ""
-    port = parsed.port or 9200
-    user = parsed.username or ""
-    password = parsed.password or ""
-    return f"{host}:{port}", user, password
+def _now() -> str:
+    return datetime.now(tz=timezone.utc).isoformat()
 
 
 def _first_float(text: str) -> float | None:
@@ -74,40 +78,33 @@ def _parse_metrics(stdout: str) -> dict:
     }
 
 
-def run_benchmark() -> None:
-    os_url = os.environ.get("OPENSEARCH_URL", "").strip()
-    if not os_url:
-        result = {
-            "ok": False,
-            "error": "OPENSEARCH_URL not set",
-            "summary": {"indexing_throughput_docs_per_sec": None, "query_latency_p90_ms": None, "query_latency_p99_ms": None},
-            "checked_at": datetime.now(tz=timezone.utc).isoformat(),
-        }
-        RESULTS_FILE.write_text(json.dumps(result, indent=2))
-        return
-
-    target_hosts, user, password = _parse_opensearch_url(os_url)
+def _run_benchmark(opensearch_url: str, workload_id: str, test_procedure: str, telemetry: str) -> None:
+    parsed = urlparse(opensearch_url)
+    host = parsed.hostname or ""
+    port = parsed.port or 9200
+    user = parsed.username or ""
+    password = parsed.password or ""
+    target_hosts = f"{host}:{port}"
 
     argv = [
         "opensearch-benchmark",
         "run",
         "--pipeline=benchmark-only",
-        f"--workload={WORKLOAD_ID}",
+        f"--workload={workload_id}",
         f"--target-hosts={target_hosts}",
         "--kill-running-processes",
     ]
-    if TELEMETRY:
-        argv.append(f"--telemetry={TELEMETRY}")
-    if TEST_PROCEDURE:
-        argv.append(f"--test-procedure={TEST_PROCEDURE}")
+    if telemetry:
+        argv.append(f"--telemetry={telemetry}")
+    if test_procedure:
+        argv.append(f"--test-procedure={test_procedure}")
     client_opts = "use_ssl:true,verify_certs:true"
     if user and password:
         client_opts += f",basic_auth_user:{user},basic_auth_password:{password}"
     argv += ["--client-options", client_opts]
 
-    print(f"[runner] starting OSB: workload={WORKLOAD_ID} target={target_hosts}", flush=True)
+    print(f"[runner] starting OSB: workload={workload_id} target={target_hosts}", flush=True)
 
-    # Stream stdout to terminal AND capture it for metrics parsing.
     collected: list[str] = []
     with subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True) as proc:
         for line in proc.stdout:  # type: ignore[union-attr]
@@ -121,31 +118,77 @@ def run_benchmark() -> None:
         "ok": returncode == 0,
         "returncode": returncode,
         "summary": summary,
-        "workload_id": WORKLOAD_ID,
-        "test_procedure": TEST_PROCEDURE,
-        "checked_at": datetime.now(tz=timezone.utc).isoformat(),
+        "workload_id": workload_id,
+        "test_procedure": test_procedure,
+        "checked_at": _now(),
     }
-    RESULTS_FILE.write_text(json.dumps(result, indent=2))
     print(f"[runner] OSB finished rc={returncode} summary={summary}", flush=True)
 
+    with _lock:
+        _state["result"] = result
+        _state["status"] = "done" if returncode == 0 else "error"
 
-def serve() -> None:
-    os.chdir("/app")
-    server = HTTPServer(("0.0.0.0", PORT), SimpleHTTPRequestHandler)
-    print(f"[runner] serving on :{PORT}", flush=True)
-    server.serve_forever()
+
+class Handler(BaseHTTPRequestHandler):
+    def log_message(self, fmt: str, *args: object) -> None:
+        print(f"[http] {fmt % args}", flush=True)
+
+    def _send_json(self, code: int, body: dict) -> None:
+        data = json.dumps(body).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def do_GET(self) -> None:
+        with _lock:
+            snapshot = dict(_state)
+        self._send_json(200, snapshot)
+
+    def do_POST(self) -> None:
+        if self.path != "/run":
+            self._send_json(404, {"error": "not found"})
+            return
+
+        length = int(self.headers.get("Content-Length", 0))
+        raw = self.rfile.read(length) if length else b"{}"
+        try:
+            body = json.loads(raw)
+        except json.JSONDecodeError:
+            self._send_json(400, {"error": "invalid JSON"})
+            return
+
+        opensearch_url = (body.get("opensearch_url") or "").strip()
+        if not opensearch_url:
+            self._send_json(400, {"error": "opensearch_url is required"})
+            return
+
+        with _lock:
+            if _state["status"] == "running":
+                self._send_json(409, {"status": "busy", "error": "a benchmark is already running"})
+                return
+            _state["status"] = "running"
+            _state["result"] = None
+
+        workload_id = (body.get("workload_id") or DEFAULT_WORKLOAD_ID).strip()
+        test_procedure = (body.get("test_procedure") or DEFAULT_TEST_PROCEDURE).strip()
+        telemetry = (body.get("telemetry") or DEFAULT_TELEMETRY).strip()
+
+        t = threading.Thread(
+            target=_run_benchmark,
+            args=(opensearch_url, workload_id, test_procedure, telemetry),
+            daemon=True,
+        )
+        t.start()
+        self._send_json(202, {"status": "started", "workload_id": workload_id, "target": opensearch_url.split("@")[-1]})
 
 
 if __name__ == "__main__":
-    # Write a placeholder so Aiven health check has a response immediately.
-    RESULTS_FILE.write_text(json.dumps({"status": "starting", "checked_at": datetime.now(tz=timezone.utc).isoformat()}))
+    with _lock:
+        _state["status"] = "idle"
+        _state["started_at"] = _now()
 
-    # Start HTTP server in background thread so Aiven can reach the port.
-    t = threading.Thread(target=serve, daemon=True)
-    t.start()
-
-    # Run benchmark synchronously; results file is updated when done.
-    run_benchmark()
-
-    # Keep serving indefinitely.
-    t.join()
+    server = HTTPServer(("0.0.0.0", PORT), Handler)
+    print(f"[runner] serving on :{PORT} (POST /run to start, GET /status to poll)", flush=True)
+    server.serve_forever()
