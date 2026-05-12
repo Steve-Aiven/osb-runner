@@ -100,8 +100,10 @@ def run_benchmark() -> None:
         argv.append(f"--telemetry={TELEMETRY}")
     if TEST_PROCEDURE:
         argv.append(f"--test-procedure={TEST_PROCEDURE}")
+    client_opts = "use_ssl:true,verify_certs:true"
     if user and password:
-        argv += ["--client-options", f"verify_certs:true,basic_auth_user:{user},basic_auth_password:{password}"]
+        client_opts += f",basic_auth_user:{user},basic_auth_password:{password}"
+    argv += ["--client-options", client_opts]
 
     print(f"[runner] starting OSB: workload={WORKLOAD_ID} target={target_hosts}", flush=True)
 
