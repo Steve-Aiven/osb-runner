@@ -90,7 +90,7 @@ def run_benchmark() -> None:
 
     argv = [
         "opensearch-benchmark",
-        "execute-test",
+        "run",
         "--pipeline=benchmark-only",
         f"--workload={WORKLOAD_ID}",
         f"--target-hosts={target_hosts}",
@@ -103,19 +103,27 @@ def run_benchmark() -> None:
         argv += ["--client-options", f"verify_certs:true,basic_auth_user:{user},basic_auth_password:{password}"]
 
     print(f"[runner] starting OSB: workload={WORKLOAD_ID} target={target_hosts}", flush=True)
-    proc = subprocess.run(argv, capture_output=False, text=True, check=False)
 
-    summary = _parse_metrics(proc.stdout or "")
+    # Stream stdout to terminal AND capture it for metrics parsing.
+    collected: list[str] = []
+    with subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True) as proc:
+        for line in proc.stdout:  # type: ignore[union-attr]
+            print(line, end="", flush=True)
+            collected.append(line)
+        proc.wait()
+    returncode = proc.returncode
+
+    summary = _parse_metrics("".join(collected))
     result = {
-        "ok": proc.returncode == 0,
-        "returncode": proc.returncode,
+        "ok": returncode == 0,
+        "returncode": returncode,
         "summary": summary,
         "workload_id": WORKLOAD_ID,
         "test_procedure": TEST_PROCEDURE,
         "checked_at": datetime.now(tz=timezone.utc).isoformat(),
     }
     RESULTS_FILE.write_text(json.dumps(result, indent=2))
-    print(f"[runner] OSB finished rc={proc.returncode} summary={summary}", flush=True)
+    print(f"[runner] OSB finished rc={returncode} summary={summary}", flush=True)
 
 
 def serve() -> None:
