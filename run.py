@@ -37,6 +37,8 @@ DEFAULT_TELEMETRY = os.environ.get("TELEMETRY", "node-stats")
 
 _lock = threading.Lock()
 _state: dict = {"status": "idle", "result": None}
+_log_lines: list[str] = []
+_LOG_TAIL = 50
 
 
 def _now() -> str:
@@ -110,6 +112,10 @@ def _run_benchmark(opensearch_url: str, workload_id: str, test_procedure: str, t
         for line in proc.stdout:  # type: ignore[union-attr]
             print(line, end="", flush=True)
             collected.append(line)
+            with _lock:
+                _log_lines.append(line.rstrip())
+                if len(_log_lines) > _LOG_TAIL:
+                    del _log_lines[0]
         proc.wait()
     returncode = proc.returncode
 
@@ -144,6 +150,7 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         with _lock:
             snapshot = dict(_state)
+            snapshot["log_tail"] = list(_log_lines)
         self._send_json(200, snapshot)
 
     def do_POST(self) -> None:
@@ -170,6 +177,7 @@ class Handler(BaseHTTPRequestHandler):
                 return
             _state["status"] = "running"
             _state["result"] = None
+            _log_lines.clear()
 
         workload_id = (body.get("workload_id") or DEFAULT_WORKLOAD_ID).strip()
         test_procedure = (body.get("test_procedure") or DEFAULT_TEST_PROCEDURE).strip()
